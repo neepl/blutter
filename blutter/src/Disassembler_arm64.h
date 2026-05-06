@@ -81,6 +81,11 @@ constexpr arm64_reg CSREG_DART_WB_VALUE = ToCapstoneReg(dart::kWriteBarrierValue
 constexpr arm64_reg CSREG_DART_WB_SLOT = ToCapstoneReg(dart::kWriteBarrierSlotReg);
 constexpr arm64_reg CSREG_DART_THR = ToCapstoneReg(dart::THR);
 constexpr arm64_reg CSREG_DART_PP = ToCapstoneReg(dart::PP);
+// dart::HEAP_BITS (R28) is defined unconditionally in the Dart SDK — it is used for write
+// barriers on all platforms, not only when DART_COMPRESSED_POINTERS is set.  Blutter
+// references CSREG_DART_HEAP in write-barrier and pointer-decompression recognition code
+// that is not guarded by DART_COMPRESSED_POINTERS, so the constant must always be defined
+// (otherwise an iOS build would fail to compile those sites).
 constexpr arm64_reg CSREG_DART_HEAP = ToCapstoneReg(dart::HEAP_BITS);
 constexpr arm64_reg CSREG_DART_TMP = ToCapstoneReg(dart::TMP);
 constexpr arm64_reg CSREG_DART_TMP2 = ToCapstoneReg(dart::TMP2);

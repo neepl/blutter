@@ -893,7 +893,10 @@ std::tuple<A64::Register, A64::Register> FunctionAnalyzer::unboxParam(AsmIterato
 	if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Double_value_offset - dart::kHeapObjectTag) {
 		// extract value from Double object
 		dstReg = A64::Register{ insn.ops(0).reg };
-		// iOS unboxes Double/Mint into GP (integer) registers, not float registers
+		// Android emits `ldur d0, [x1, #off]` — destination is a float register.
+		// iOS emits   `ldur x0, [x1, #off]` — destination is an integer (GP) register.
+		// There is no IsDecimal() guard here: both variants are valid and the source-register
+		// check below is sufficient to reject mismatches.
 		srcReg = A64::Register{ insn.ops(1).mem.base };
 		if (expectedSrcReg.IsSet() && expectedSrcReg != srcReg)
 			return { A64::Register{}, A64::Register{} };
