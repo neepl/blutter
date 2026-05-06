@@ -4,6 +4,7 @@ import glob
 import mmap
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -48,18 +49,30 @@ class BlutterInput:
 
 
 def find_lib_files(indir: str):
-    app_file = os.path.join(indir, 'libapp.so')
-    if not os.path.isfile(app_file):
-        app_file = os.path.join(indir, 'App')
-        if not os.path.isfile(app_file):
-            sys.exit("Cannot find libapp file")
-    
-    flutter_file = os.path.join(indir, 'libflutter.so')
-    if not os.path.isfile(flutter_file):
-        flutter_file = os.path.join(indir, 'Flutter')
-        if not os.path.isfile(flutter_file):
-            sys.exit("Cannot find libflutter file")
-    
+    # App binary: Android → iOS (Dart ≤2.17 direct embed) → iOS (Dart ≥2.17 App.framework)
+    for candidate in [
+        os.path.join(indir, 'libapp.so'),
+        os.path.join(indir, 'App'),
+        os.path.join(indir, 'Frameworks', 'App.framework', 'App'),
+    ]:
+        if os.path.isfile(candidate):
+            app_file = candidate
+            break
+    else:
+        sys.exit("Cannot find libapp file")
+
+    # Flutter binary: Android → iOS (direct) → iOS (inside Frameworks/)
+    for candidate in [
+        os.path.join(indir, 'libflutter.so'),
+        os.path.join(indir, 'Flutter'),
+        os.path.join(indir, 'Frameworks', 'Flutter.framework', 'Flutter'),
+    ]:
+        if os.path.isfile(candidate):
+            flutter_file = candidate
+            break
+    else:
+        sys.exit("Cannot find libflutter file")
+
     return os.path.abspath(app_file), os.path.abspath(flutter_file)
 
 def extract_libs_from_apk(apk_file: str, out_dir: str):
@@ -76,6 +89,26 @@ def extract_libs_from_apk(apk_file: str, out_dir: str):
         app_file = os.path.join(out_dir, app_info.filename)
         flutter_file = os.path.join(out_dir, flutter_info.filename)
         return app_file, flutter_file
+
+def extract_libs_from_ipa(ipa_file: str, out_dir: str):
+    with zipfile.ZipFile(ipa_file, 'r') as zf:
+        names = zf.namelist()
+        # App binary: Dart ≥2.17 embeds in App.framework; older versions embed directly
+        app_entry = next(
+            (n for n in names if re.match(r'Payload/[^/]+\.app/Frameworks/App\.framework/App$', n)),
+            next((n for n in names if re.match(r'Payload/[^/]+\.app/App$', n)), None)
+        )
+        flutter_entry = next(
+            (n for n in names if re.match(r'Payload/[^/]+\.app/Frameworks/Flutter\.framework/Flutter$', n)),
+            None
+        )
+        if app_entry is None:
+            sys.exit("Cannot find App binary in IPA")
+        if flutter_entry is None:
+            sys.exit("Cannot find Flutter.framework/Flutter in IPA")
+        zf.extract(app_entry, out_dir)
+        zf.extract(flutter_entry, out_dir)
+    return os.path.join(out_dir, app_entry), os.path.join(out_dir, flutter_entry)
 
 def find_compat_macro(dart_version: str, no_analysis: bool):
     macros = []
@@ -225,6 +258,10 @@ def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
             main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+    elif indir.endswith(".ipa"):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            libapp_file, libflutter_file = extract_libs_from_ipa(indir, tmp_dir)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
         main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
@@ -234,8 +271,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog='B(l)utter',
         description='Reversing a flutter application tool')
-    # TODO: accept ipa
-    parser.add_argument('indir', help='An apk or a directory that contains both libapp.so and libflutter.so')
+    parser.add_argument('indir', help='An apk, ipa, or a directory containing libapp.so/App and libflutter.so/Flutter')
     parser.add_argument('outdir', help='An output directory')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')

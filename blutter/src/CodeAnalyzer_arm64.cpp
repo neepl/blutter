@@ -184,10 +184,12 @@ static VarValue* getPoolObject(DartApp& app, intptr_t offset, A64::Register dstR
 }
 
 static inline void handleDecompressPointer(AsmIterator& insn, arm64_reg reg) {
+#if defined(DART_COMPRESSED_POINTERS)
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(0).reg == insn.ops(1).reg && insn.ops(0).reg == reg);
 	INSN_ASSERT(insn.ops(2).reg == CSREG_DART_HEAP && insn.ops(2).shift.value == 32);
 	++insn;
+#endif
 }
 
 static inline void handleExtraDecompressPointer(AsmIterator& insn, arm64_reg reg) {
@@ -891,8 +893,7 @@ std::tuple<A64::Register, A64::Register> FunctionAnalyzer::unboxParam(AsmIterato
 	if (insn.id() == ARM64_INS_LDUR && insn.ops(1).mem.disp == AOT_Double_value_offset - dart::kHeapObjectTag) {
 		// extract value from Double object
 		dstReg = A64::Register{ insn.ops(0).reg };
-		if (!dstReg.IsDecimal())
-			return { A64::Register{}, A64::Register{} };
+		// iOS unboxes Double/Mint into GP (integer) registers, not float registers
 		srcReg = A64::Register{ insn.ops(1).mem.base };
 		if (expectedSrcReg.IsSet() && expectedSrcReg != srcReg)
 			return { A64::Register{}, A64::Register{} };
@@ -922,8 +923,10 @@ void FunctionAnalyzer::handleFixedParameters(AsmIterator& insn, arm64_reg paramC
 		if (insn.id() != ARM64_INS_ADD)
 			break;
 		INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-		// shift only 2 because the number of parameter is Smi (tagged)
-		INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == paramCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+		// shift=2 because paramCntReg is Smi-tagged (value<<1), so fp + smi<<2 = fp + value*8
+		// Android uses w-reg with sxtw; iOS uses x-reg with lsl (no sign-extend needed)
+		INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == paramCntReg && insn.ops(2).shift.value == 2 &&
+			(insn.ops(2).ext == ARM64_EXT_SXTW || insn.ops(2).shift.type == ARM64_SFT_LSL));
 		const auto tmpReg = insn.ops(0).reg;
 		++insn;
 
@@ -994,8 +997,9 @@ void FunctionAnalyzer::handleOptionalPositionalParameters(AsmIterator& insn, arm
 
 		// parameter might not be used and no loading value
 		if (insn.id() == ARM64_INS_ADD && insn.ops(1).reg == CSREG_DART_FP) {
-			// shift only 2 because the number of parameter is Smi (tagged)
-			INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == optionalParamCntReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			// shift=2: paramCntReg is Smi-tagged; Android uses sxtw (w-reg), iOS uses lsl (x-reg)
+			INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == optionalParamCntReg && insn.ops(2).shift.value == 2 &&
+				(insn.ops(2).ext == ARM64_EXT_SXTW || insn.ops(2).shift.type == ARM64_SFT_LSL));
 			const auto tmpReg = insn.ops(0).reg;
 			++insn;
 
@@ -1038,15 +1042,13 @@ void FunctionAnalyzer::handleOptionalPositionalParameters(AsmIterator& insn, arm
 			param.valReg = dstReg;
 		}
 
-		// might be moved to another register
+		// might be moved to another register (skip unrecognized instructions — iOS may emit extra computation here)
 		while (!insn.IsBranch()) {
-			INSN_ASSERT(insn.id() == ARM64_INS_MOV);
-			INSN_ASSERT(insn.ops(0).type == ARM64_OP_REG && insn.ops(1).type == ARM64_OP_REG && insn.ops(1).reg != CSREG_DART_NULL);
-			const auto srcReg = A64::Register{ insn.ops(1).reg };
-			//auto found = fnInfo->params.movValReg(A64::Register{ insn.ops(0).reg }, srcReg);
-			//INSN_ASSERT(found);
-			auto valParam = fnInfo->State()->MoveRegister(insn.ops(0).reg, srcReg);
-			INSN_ASSERT(valParam);
+			if (insn.id() == ARM64_INS_MOV && insn.ops(0).type == ARM64_OP_REG && insn.ops(1).type == ARM64_OP_REG && insn.ops(1).reg != CSREG_DART_NULL) {
+				const auto srcReg = A64::Register{ insn.ops(1).reg };
+				auto valParam = fnInfo->State()->MoveRegister(insn.ops(0).reg, srcReg);
+				INSN_ASSERT(valParam);
+			}
 			++insn;
 		}
 		const auto storingBranchTarget = insn.ops(0).imm;
@@ -1137,12 +1139,18 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 				INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 				INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == fnInfo->Vars()->ValArgsDesc());
-				INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 1);
+				// Android: w-reg with sxtw #1 (4-byte elements); iOS: x-reg with lsl #2 (8-byte elements)
+				INSN_ASSERT(insn.ops(2).reg == tmpReg &&
+					((insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 1) ||
+					 (insn.ops(2).shift.type == ARM64_SFT_LSL && insn.ops(2).shift.value == 2)));
 				const auto tmpReg2 = insn.ops(0).reg;
 				++insn;
 
 				INSN_ASSERT(insn.id() == ARM64_INS_LDUR);
-				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 && insn.ops(1).mem.disp == sizeof(void*) * 2 - dart::kHeapObjectTag);
+				// LDUR displacement: Android (compressed) = kWordSize*2 - kTag = 15; iOS (uncompressed) = kWordSize*3 - kTag = 23
+				INSN_ASSERT(insn.ops(1).mem.base == tmpReg2 &&
+					(insn.ops(1).mem.disp == sizeof(void*) * 2 - dart::kHeapObjectTag ||
+					 insn.ops(1).mem.disp == sizeof(void*) * 3 - dart::kHeapObjectTag));
 				const auto dstReg = ToCapstoneReg(insn.ops(0).reg);
 				++insn;
 
@@ -1340,7 +1348,9 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 
 			INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 			INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-			INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+			// Android uses sxtw (w-reg), iOS uses lsl (x-reg)
+			INSN_ASSERT(insn.ops(2).reg == tmpReg && insn.ops(2).shift.value == 2 &&
+				(insn.ops(2).ext == ARM64_EXT_SXTW || insn.ops(2).shift.type == ARM64_SFT_LSL));
 			const auto tmpReg2 = insn.ops(0).reg;
 			++insn;
 
@@ -1393,10 +1403,16 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 		if (!isRequired) {
 			// Smi to native. only non first and last name do it
 			if (nameParamCnt && !isLastName) {
-				// 0x412924: sbfx  x5, x2, #1, #0x1f
+				// 0x412924: sbfx  x5, x2, #1, #0x1f  (Android: 30-bit Smi to native)
+				// iOS: asr xN, xM, #1  (62-bit Smi to native)
 				if (insn.id() == ARM64_INS_SBFX) {
 					INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == &valNameCurrParamPosSmi);
 					INSN_ASSERT(insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f);
+					fnInfo->State()->SetRegister(insn.ops(0).reg, fnInfo->Vars()->ValCurrNumNameParam());
+					++insn;
+				}
+				else if (insn.id() == ARM64_INS_ASR && insn.ops(2).imm == 1) {
+					INSN_ASSERT(fnInfo->State()->GetValue(insn.ops(1).reg) == &valNameCurrParamPosSmi);
 					fnInfo->State()->SetRegister(insn.ops(0).reg, fnInfo->Vars()->ValCurrNumNameParam());
 					++insn;
 				}
@@ -1426,7 +1442,9 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 			// no skipping if no loading parameter value
 			const auto nextParamAddr = [&] {
 				if (doLoadValue || nameParamCnt == 0) {
-					INSN_ASSERT(insn.IsBranch());
+					// iOS may emit extra computation instructions before the branch; skip them
+					while (!insn.IsBranch())
+						++insn;
 					const auto nextParamAddr = insn.ops(0).imm;
 					++insn;
 					return nextParamAddr;
@@ -1444,8 +1462,9 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 			}
 
 			// TODO: split state for match and mismatch branch, so all param can be tracked correctly
-			if (insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f) {
-				// assume curr param pos Smi to native in default branch
+			// skip Smi-to-native in default branch: SBFX (Android 30-bit) or ASR (iOS 62-bit)
+			if ((insn.id() == ARM64_INS_SBFX && insn.ops(2).imm == 1 && insn.ops(3).imm == 0x1f) ||
+				(insn.id() == ARM64_INS_ASR && insn.ops(2).imm == 1)) {
 				++insn;
 			}
 
@@ -1481,7 +1500,11 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 				auto il = processLoadValueInstr(insn);
 				if (!il)
 					break;
-				INSN_ASSERT(fnInfo->State()->GetValue(il->dstReg)->AsParam()->idx == fnInfo->params.NumParam() - 1);
+				// On iOS the unboxed value may land in a GP register not tracked as a Parameter
+				auto* paramVal = fnInfo->State()->GetValue(il->dstReg);
+				if (paramVal && paramVal->AsParam()) {
+					INSN_ASSERT(paramVal->AsParam()->idx == fnInfo->params.NumParam() - 1);
+				}
 				fnInfo->params.back().val = il->val.TakeValue();
 
 				// very weird case in Dart 3.2.3. duplicate loading value
@@ -1504,8 +1527,9 @@ void FunctionAnalyzer::handleOptionalNamedParameters(AsmIterator& insn, arm64_re
 			const auto storeRes = handleStoreLocal(insn);
 			if (storeRes.fpOffset != 0) {
 				auto val = fnInfo->State()->GetValue(storeRes.srcReg);
-				INSN_ASSERT(val && val->RawTypeId() == VarValue::Parameter);
-				fnInfo->State()->SetLocal(storeRes.fpOffset, val);
+				// On iOS the register being stored may not be tracked as a Parameter (e.g. null default value path)
+				if (val && val->RawTypeId() == VarValue::Parameter)
+					fnInfo->State()->SetLocal(storeRes.fpOffset, val);
 			}
 		}
 		// end of a named parameter
@@ -1584,7 +1608,9 @@ void FunctionAnalyzer::handleArgumentsDescriptorTypeArguments(AsmIterator& insn)
 
 	INSN_ASSERT(insn.id() == ARM64_INS_ADD);
 	INSN_ASSERT(insn.ops(1).reg == CSREG_DART_FP);
-	INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == sizeReg && insn.ops(2).ext == ARM64_EXT_SXTW && insn.ops(2).shift.value == 2);
+	// Android uses sxtw (w-reg), iOS uses lsl (x-reg)
+	INSN_ASSERT(ToCapstoneReg(insn.ops(2).reg) == sizeReg && insn.ops(2).shift.value == 2 &&
+		(insn.ops(2).ext == ARM64_EXT_SXTW || insn.ops(2).shift.type == ARM64_SFT_LSL));
 	const auto tmpReg = insn.ops(0).reg;
 	fnInfo->State()->ClearRegister(tmpReg);
 	++insn;
@@ -2978,6 +3004,31 @@ std::unique_ptr<LoadInt32Instr> FunctionAnalyzer::processLoadInt32FromBoxOrSmiIn
 			return std::make_unique<LoadInt32Instr>(insn.Wrap(ins0_addr), dstReg, srcReg);
 		}
 	}
+	// iOS arm64 (no DART_COMPRESSED_POINTERS): asr x0, x1, #1  (62-bit Smi unboxing)
+	else if (insn.id() == ARM64_INS_ASR && insn.ops(2).imm == dart::kSmiTagSize) {
+		const auto in_reg = insn.ops(1).reg;
+		const auto srcReg = A64::Register{ in_reg };
+		if (!expectedSrcReg.IsSet() || expectedSrcReg == srcReg) {
+			const auto out_reg = insn.ops(0).reg;
+			const auto dstReg = A64::Register{ out_reg };
+			const auto ins0_addr = insn.address();
+			++insn;
+
+			if (insn.id() == ARM64_INS_TBZ && A64::Register{ insn.ops(0).reg } == srcReg && insn.ops(1).imm == dart::kSmiTag) {
+				const auto cont_addr = insn.ops(2).imm;
+				++insn;
+
+				INSN_ASSERT(insn.id() == ARM64_INS_LDUR);
+				INSN_ASSERT(insn.ops(0).reg == out_reg);
+				INSN_ASSERT(insn.ops(1).mem.base == in_reg && insn.ops(1).mem.disp == dart::Mint::value_offset() - dart::kHeapObjectTag);
+				++insn;
+
+				INSN_ASSERT(insn.address() == cont_addr);
+			}
+
+			return std::make_unique<LoadInt32Instr>(insn.Wrap(ins0_addr), dstReg, srcReg);
+		}
+	}
 	return nullptr;
 }
 
@@ -2992,7 +3043,7 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterato
 		// LoadStaticFieldInstr::EmitNativeCode()
 		// 0x21cb80: ldr  x0, [x26, #0x68]  (Thread::field_table_values)
 		//    ; might have an extra add if field_offset is larger than 0x8000 => add x17, x0, #8, lsl #12
-		// 0x21cb84: ldr  x0, [x0, #0x1730]  ; Smi(field_offset) = 0x1730
+		// 0x21cb84: ldr  x0, [x0, #0x1730]  ; disp = FieldOffsetFor(field_id) = field_id * sizeof(ObjectPtr)
 		// 0x21cb88: ldr  x16, [x27, #0x28]  (PP+0x28 - XXX: sentinel (30))
 		// 0x21cb8c: cmp  w0, w16
 		// 0x21cb90: b.ne  #0x21cba0
@@ -3022,7 +3073,10 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadFieldTableInstr(AsmIterato
 
 		INSN_ASSERT(insn.ops(1).mem.base == tmp_reg);
 		load_offset |= insn.ops(1).mem.disp;
-		const auto field_offset = load_offset >> 1;
+		// FieldOffsetFor = field_id * sizeof(ObjectPtr) = field_id * kWordSize
+		// TargetOffset   = field_id * kCompressedWordSize
+		// so shift down by the difference to convert LDR displacement → TargetOffset
+		const auto field_offset = load_offset >> (dart::kWordSizeLog2 - dart::kCompressedWordSizeLog2);
 
 		if (insn.id() == ARM64_INS_STR) {
 			const auto reg = A64::Register{ insn.ops(0).reg };
@@ -3525,7 +3579,12 @@ std::unique_ptr<ILInstr> FunctionAnalyzer::processLoadStore(AsmIterator& insn)
 				INSN_ASSERT(shift.value == idxShiftVal);
 			}
 			bool isTypedData = dart::UntaggedTypedData::payload_offset() - dart::kHeapObjectTag == arr_data_offset;
-			INSN_ASSERT(isTypedData || arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag);
+			bool isArray = arr_data_offset == dart::Array::data_offset() - dart::kHeapObjectTag;
+			// On iOS (uncompressed), OneByteString chars are at data_offset-kTag = 0xf
+			bool isString = arr_data_offset == dart::OneByteString::data_offset() - dart::kHeapObjectTag
+				|| arr_data_offset == dart::TwoByteString::data_offset() - dart::kHeapObjectTag;
+			if (!isTypedData && !isArray && !isString)
+				return nullptr;
 			const auto op0Reg = A64::Register{ insn.ops(0).reg };
 			++insn;
 			if (arrayOp.isLoad) {

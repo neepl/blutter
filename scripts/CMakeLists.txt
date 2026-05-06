@@ -55,12 +55,13 @@ set_target_properties(${LIBNAME} PROPERTIES
 	POSITION_INDEPENDENT_CODE ON)
 
 # DART_TARGET_OS_ANDROID or DART_TARGET_OS_MACOS_IOS
+# Note: iOS requires both DART_TARGET_OS_MACOS and DART_TARGET_OS_MACOS_IOS (see globals.h and dart.cc OS detection)
 if (${TARGET_OS} STREQUAL "android")
 	set(target_os "DART_TARGET_OS_ANDROID")
 	# Note: DART_COMPRESSED_POINTERS should be from the binary
 	#set(dart_pointers "DART_COMPRESSED_POINTERS")
 else()
-	set(target_os "DART_TARGET_OS_MACOS_IOS")
+	set(target_os "DART_TARGET_OS_MACOS_IOS" "DART_TARGET_OS_MACOS")
 endif()
 # TARGET_ARCH_ARM64 or TARGET_ARCH_X64
 if (${TARGET_ARCH} STREQUAL "arm64")

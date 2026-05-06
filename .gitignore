@@ -15,3 +15,7 @@ pyrightconfig.json
 *.so
 *.dll
 *.lib
+.DS_Store
+.envrc
+.tool-versions
+
